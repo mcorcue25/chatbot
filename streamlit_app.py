@@ -187,40 +187,59 @@ def actualizar_esios():
 def consultar_ia(pregunta, df_spot, df_omip):
     try:
         client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+        # ==========================================
+# 4. INTELIGENCIA ARTIFICIAL (MEJORADA - ANTI-ERRORES)
+# ==========================================
+def consultar_ia(pregunta, df_spot, df_omip):
+    try:
+        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
         
-        # Contexto de datos reducido para el prompt
+        # Preparamos muestras de datos
         txt_spot = df_spot.tail(48).to_string(index=False) if df_spot is not None else "Sin datos"
+        # Mostramos las columnas disponibles para que la IA no invente nombres
+        cols_omip = list(df_omip.columns) if not df_omip.empty else "Sin columnas"
         txt_omip = df_omip.head(5).to_string(index=False) if not df_omip.empty else "Sin datos"
         
         prompt = f"""
-        ACTÚA COMO UN GENERADOR DE CÓDIGO PYTHON PURO PARA ANÁLISIS DE DATOS.
+        ACTÚA COMO UN GENERADOR DE CÓDIGO PYTHON EXPERTO Y ROBUSTO.
         
-        CONTEXTO DE DATOS DISPONIBLES:
-        1. df_spot (pandas DataFrame): Datos horarios. Columnas: [fecha_hora, precio].
-           Muestra: {txt_spot}
-           
-        2. df_omip (pandas DataFrame): Futuros diarios. Columnas: [Fecha, Q1-26, YR-27...].
-           Muestra: {txt_omip}
+        DATOS DISPONIBLES:
+        1. df_spot (DataFrame): [fecha_hora, precio].
+        2. df_omip (DataFrame): [Fecha, ...].
+           COLUMNAS EXACTAS DISPONIBLES EN DF_OMIP: {cols_omip}
+           Muestra datos: {txt_omip}
 
-        OBJETIVO DEL USUARIO:
+        OBJETIVO:
         {pregunta}
 
-        REGLAS ESTRICTAS DE GENERACIÓN (OBLIGATORIO):
-        1. RESPONDE ÚNICAMENTE CON CÓDIGO PYTHON VÁLIDO.
-        2. NO incluyas texto introductorio, ni explicaciones, ni markdown (evita ```python).
-        3. Debes crear una variable llamada 'resultado' (string) que contenga la respuesta textual final para el usuario.
-        4. Si generas un gráfico, usa 'plt.figure()', dibuja y NO uses plt.show().
-        5. Asume que las librerías 'pd' y 'plt' y los dataframes 'df_spot' y 'df_omip' ya existen.
+        REGLAS DE SEGURIDAD (CRÍTICO PARA EVITAR CRASH):
+        1. NO asumas que los datos siempre existen.
+        2. ANTES de extraer un valor único (ej: `valor = df_filt.values[0]`), DEBES verificar si el dataframe filtrado tiene filas.
+           
+           MALO:
+           precio = df_omip.loc[...].values[0] # Esto crashea si no hay datos
+           
+           BUENO:
+           filtro = df_omip.loc[...]
+           if not filtro.empty:
+               precio = filtro.values[0]
+           else:
+               resultado = "No se encontraron datos para esa fecha/contrato."
+               return # O detener lógica
+
+        3. La variable final a mostrar debe llamarse 'resultado' (string).
+        4. RESPONDE SOLO CÓDIGO PYTHON PURO (sin markdown, sin explicaciones).
+        5. Si usas fechas, recuerda que en df_omip la columna 'Fecha' es datetime.
         """
         
         chat = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.3-70b-versatile",
-            temperature=0.0 # Cero creatividad para evitar charla
+            temperature=0.0
         )
         return chat.choices[0].message.content
     except Exception as e:
-        return f"resultado = 'Error en la llamada a la IA: {e}'"
+        return f"resultado = 'Error conectando con la IA: {e}'"
 
 # ==========================================
 # INTERFAZ PRINCIPAL

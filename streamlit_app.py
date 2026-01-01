@@ -14,20 +14,18 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from datetime import date
-# --- NUEVA IMPORTACIÓN ---
 from streamlit_gsheets import GSheetsConnection
 
 # --- CONFIGURACIÓN GLOBAL ---
 st.set_page_config(page_title="Super Analista Energía ⚡", page_icon="🔋", layout="wide")
 st.title("⚡ Asistente de Mercado Eléctrico (Spot + Futuros)")
-st.caption("Motor: Llama 3.3-70b | Datos: ESIOS (REE) & OMIP (Google Sheets)")
+st.caption("Motor: Llama 3.3-70b | Datos: ESIOS (Histórico) & OMIP (Futuros)")
 
-# Archivos de datos
+# Archivos de datos locales (Caché)
 FILE_SPOT = "datos_luz.csv"
-# FILE_OMIP = "historico_omip.csv"  <-- YA NO SE USA PARA LECTURA, USAMOS G-SHEETS
 
 # ==========================================
-# 1. MÓDULO DE DATOS: ESIOS (SPOT)
+# 1. MÓDULO DE DATOS: ESIOS (SPOT - PASADO)
 # ==========================================
 def actualizar_esios():
     INDICATOR_ID = "805" # Precio Mercado Spot
@@ -45,7 +43,7 @@ def actualizar_esios():
     status_text = st.empty()
     
     for i, year in enumerate(years):
-        status_text.text(f"⏳ Descargando ESIOS año {year}...")
+        status_text.text(f"⏳ Descargando Histórico ESIOS {year}...")
         
         url = f"https://api.esios.ree.es/indicators/{INDICATOR_ID}"
         headers = {
@@ -87,42 +85,29 @@ def actualizar_esios():
         full_df = pd.concat(dfs)
         full_df = full_df.sort_values('fecha_hora').reset_index(drop=True)
         full_df.to_csv(FILE_SPOT, index=False)
-        st.success(f"✅ ESIOS Actualizado: {len(full_df)} registros.")
+        st.success(f"✅ ESIOS Actualizado: {len(full_df)} horas de datos históricos.")
         return True
     else:
         st.error("❌ No se pudieron descargar datos de ESIOS.")
         return False
 
 # ==========================================
-# 2. MÓDULO DE DATOS: OMIP (GOOGLE SHEETS)
+# 2. MÓDULO DE DATOS: OMIP (FUTUROS - GOOGLE SHEETS)
 # ==========================================
-
-# --- NUEVA FUNCIÓN PARA CARGAR Y LIMPIAR DESDE SHEETS ---
 def cargar_omip_sheets():
     try:
-        # 1. Conexión a Google Sheets
         conn = st.connection("gsheets", type=GSheetsConnection)
-        
-        # 2. Lectura de datos (ttl=0 para que no use caché y lea siempre lo fresco)
         df = conn.read(ttl=0)
         
-        # 3. LIMPIEZA DE FORMATO (CRÍTICO PARA TU EXCEL)
-        # El formato viene como "64,5" (string con coma) y fechas "dd/mm/yyyy"
-        
-        # A. Limpiar Fechas
+        # --- LIMPIEZA DE DATOS ---
         if 'Fecha' in df.columns:
-            # dayfirst=True es clave para 7/03/2025
             df['Fecha'] = pd.to_datetime(df['Fecha'], dayfirst=True, errors='coerce')
-            # Ordenamos por fecha descendente
             df = df.sort_values('Fecha', ascending=False)
 
-        # B. Limpiar Números (Q1-26, YR-26, etc.)
         cols_a_ignorar = ['Fecha']
         for col in df.columns:
             if col not in cols_a_ignorar:
-                # Si la columna es tipo objeto (texto), intentamos arreglar la coma
                 if df[col].dtype == 'object':
-                    # Reemplazar coma por punto y convertir a float
                     df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
                     df[col] = pd.to_numeric(df[col], errors='coerce')
         
@@ -132,18 +117,8 @@ def cargar_omip_sheets():
         st.error(f"❌ Error conectando con Google Sheets: {e}")
         return None
 
-# Mantenemos la función de Scraping por si quieres actualizar datos, 
-# PERO AHORA DEBERÍA ESCRIBIR EN EL SHEET O EN LOCAL PARA LUEGO SUBIRLO.
-# Para simplificar, dejo tu función de scraping escribiendo en local, 
-# pero la lectura principal vendrá del Sheet.
-def actualizar_omip_scraping():
-    # ... (Tu código de Selenium existente se mantiene igual para scraping local) ...
-    # NOTA: Si quieres que esto actualice el Google Sheet automáticamente, 
-    # requeriría credenciales de escritura (Service Account), lo cual es más complejo.
-    pass 
-
 # ==========================================
-# 3. CEREBRO IA (GROQ)
+# 3. CEREBRO IA (LÓGICA PASADO VS FUTURO)
 # ==========================================
 class CerebroGroq:
     def __init__(self, df_spot, df_omip, api_key):
@@ -152,48 +127,47 @@ class CerebroGroq:
         self.client = Groq(api_key=api_key)
         
     def pensar_y_programar(self, pregunta):
-        # Contexto
+        # Contexto temporal
         zona_es = pytz.timezone('Europe/Madrid')
         ahora = datetime.datetime.now(zona_es)
         hoy_str = ahora.strftime("%Y-%m-%d")
         
-        # Info de los Dataframes
-        info_spot = str(self.df_spot.dtypes)
-        
-        # Formateamos la muestra de OMIP para que la IA entienda bien los datos
+        # Preparación de muestras para el prompt
         if self.df_omip is not None:
-            # Le pasamos las primeras 5 filas y los tipos de datos para que vea que son floats
-            info_omip = self.df_omip.head(5).to_markdown(index=False)
-            dtypes_omip = str(self.df_omip.dtypes)
+            info_omip = self.df_omip.head(3).to_markdown(index=False)
+            cols_omip = list(self.df_omip.columns)
         else:
-            info_omip = "No hay datos de OMIP disponibles."
-            dtypes_omip = ""
+            info_omip = "No disponible"
+            cols_omip = []
 
+        # --- PROMPT REFINADO: LÓGICA PASADO VS FUTURO ---
         prompt_sistema = f"""
-        Eres un experto analista de mercados energéticos en Python.
+        Eres un programador experto en análisis de mercados energéticos (Python/Pandas).
+        Hoy es: {hoy_str}
         
-        --- CONTEXTO ---
-        HOY ES: {hoy_str}
+        TIENES DOS FUENTES DE DATOS:
+
+        1. 🔙 FUENTE DEL PASADO (df_spot):
+           - Contiene: Precios HISTÓRICOS reales hora a hora (2024, 2025 hasta hoy).
+           - Columnas: ['fecha_hora', 'precio_eur_mwh']
+           - Uso: ÚSALO SIEMPRE que pregunten por "ayer", "semana pasada", "año pasado", "histórico", "tendencia actual".
+
+        2. 🔮 FUENTE DEL FUTURO (df_omip):
+           - Contiene: Cotizaciones de FUTUROS (Años 2026, 2027... y Trimestres Q1-26, etc).
+           - Columnas Disponibles: {cols_omip}
+           - Muestra: {info_omip}
+           - Uso: ÚSALO SIEMPRE que pregunten por "futuro", "año que viene", "2026", "2027", "previsión", "precio de cierre".
         
-        TIENES ACCESO A DOS DATAFRAMES:
-        1. 'df_spot': Histórico horario ESIOS. Columnas: [fecha_hora (datetime), precio_eur_mwh (float)].
-           
-        2. 'df_omip': Histórico futuros OMIP (Origen: Google Sheets).
-           - Columnas: [Fecha (datetime), Q1-26 (float), YR-26 (float), etc...]
-           - Muestra de datos: 
-           {info_omip}
-           - Tipos de datos:
-           {dtypes_omip}
-        
-        --- REGLAS DE ORO ---
-        1. SI PIDEN DATOS DE HOY/AYER: Usa 'df_spot'. 
-        2. SI PIDEN FUTUROS: Usa 'df_omip'. Recuerda que 'Fecha' es la fecha de cotización.
-           Ejemplo: Para ver cómo cerró el Q2-26 ayer, filtra 'df_omip' por la fecha más reciente.
-        3. SI PIDEN COMPARAR: Puedes usar ambos.
-        4. IMPORTANTE FORMATO NÚMEROS: Los datos de OMIP ya están convertidos a FLOAT (ej: 64.5). No intentes reemplazar comas, ya está hecho.
-        5. VARIABLE FINAL: Guarda el resultado explicativo en la variable 'resultado'.
-        6. GRÁFICOS: Usa matplotlib (plt).
-        7. Devuelve SOLO CÓDIGO PYTHON puro.
+        REGLAS DE DECISIÓN ESTRICTAS:
+        A. Si preguntan "¿Cómo estaba el precio ayer?" -> `df_spot`.
+        B. Si preguntan "¿A cuánto está el Q2-26?" -> `df_omip`.
+        C. Si preguntan "¿Sale rentable comprar futuros?" -> USA AMBOS. Calcula la media actual de `df_spot` y compárala con el valor del futuro en `df_omip`.
+
+        INSTRUCCIONES TÉCNICAS:
+        1. Genera SOLO CÓDIGO PYTHON.
+        2. Guarda la respuesta en texto en la variable 'resultado'.
+        3. Si haces gráficas, usa `plt` pero NO uses `plt.show()`.
+        4. OJO FECHAS OMIP: La columna 'Fecha' en `df_omip` es datetime64.
         """
         
         try:
@@ -203,7 +177,7 @@ class CerebroGroq:
                     {"role": "user", "content": pregunta}
                 ],
                 model="llama-3.3-70b-versatile",
-                temperature=0
+                temperature=0.0 # Cero creatividad para seguir reglas estrictas
             )
             codigo = chat_completion.choices[0].message.content
             codigo = codigo.replace("```python", "").replace("```", "").strip()
@@ -219,7 +193,8 @@ class CerebroGroq:
                 "pd": pd, 
                 "plt": plt, 
                 "sns": sns, 
-                "resultado": None
+                "resultado": None,
+                "date": date
             }
             exec(codigo, {}, local_vars)
             
@@ -231,15 +206,15 @@ class CerebroGroq:
             elif resultado:
                 return "TXT", str(resultado)
             else:
-                return "ERR", "El código se ejecutó pero no generó texto en variable 'resultado' ni gráficos."
+                return "ERR", "El código se ejecutó pero no generó la variable 'resultado'."
         except Exception as e:
-            return "ERR", f"Error de ejecución Python: {e}"
+            return "ERR", f"Error de ejecución: {e}"
 
 # ==========================================
 # 4. INTERFAZ PRINCIPAL
 # ==========================================
 
-# --- CARGAR DATOS AL INICIO ---
+# --- CARGAR DATOS ---
 @st.cache_data
 def cargar_spot():
     if os.path.exists(FILE_SPOT):
@@ -248,7 +223,6 @@ def cargar_spot():
         return df
     return None
 
-# Cargamos OMIP desde la nueva función de Sheets
 df_omip = cargar_omip_sheets()
 df_spot = cargar_spot()
 
@@ -258,33 +232,31 @@ cerebro = CerebroGroq(df_spot, df_omip, api_key) if api_key else None
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("🔄 Actualización de Datos")
+    st.header("⚙️ Panel de Control")
     
-    if st.button("Descargar ESIOS (Spot)"):
+    if st.button("🔄 Actualizar Histórico (ESIOS)"):
         if actualizar_esios():
             st.cache_data.clear()
             st.rerun()
     
-    # Botón para recargar Sheets manualmente (limpia caché)
-    if st.button("Recargar Google Sheets"):
+    if st.button("🔄 Refrescar Futuros (Sheets)"):
         st.cache_data.clear()
         st.rerun()
 
     st.divider()
-    st.write("📊 Estado de Datos:")
+    st.write("📊 **Resumen de Datos:**")
     if df_spot is not None:
-        st.success(f"Spot: {len(df_spot)} horas")
+        st.info(f"🔙 **Pasado (Spot):**\n{len(df_spot)} registros horarios.\n(Fuente: ESIOS)")
     else:
-        st.warning("Spot: Sin datos")
+        st.warning("Faltan datos de ESIOS.")
 
     if df_omip is not None:
-        st.success(f"Futuros (Sheets): {len(df_omip)} días")
-        st.dataframe(df_omip.head(3), hide_index=True) # Previsualización rápida
+        st.info(f"🔮 **Futuro (OMIP):**\n{len(df_omip)} días de cotización.\n(Fuente: Google Sheets)")
     else:
-        st.error("Futuros: Error al conectar con Sheets")
+        st.error("Error conectando a Sheets.")
 
-# --- CHAT INTERFACE ---
-st.subheader("💬 Consulta a tu Data Warehouse")
+# --- CHAT ---
+st.subheader("💬 Analista de Mercado")
 
 if "mensajes" not in st.session_state:
     st.session_state.mensajes = []
@@ -298,7 +270,7 @@ for msg in st.session_state.mensajes:
         elif msg["tipo"] == "CODE":
             st.code(msg["contenido"])
 
-pregunta = st.chat_input("Ej: ¿Cómo ha evolucionado el Q2-26 esta semana?")
+pregunta = st.chat_input("Ej: ¿Cómo está el precio hoy? vs ¿A cuánto cotiza el 2026?")
 
 if pregunta:
     st.session_state.mensajes.append({"rol": "user", "tipo": "TXT", "contenido": pregunta})
@@ -306,21 +278,17 @@ if pregunta:
         st.write(pregunta)
     
     if not cerebro:
-        st.error("Falta configurar la GROQ_API_KEY en secrets.")
+        st.error("⚠️ Configura tu API KEY en .streamlit/secrets.toml")
     else:
         with st.chat_message("assistant"):
-            with st.spinner("Analizando datos de Sheets y ESIOS..."):
+            with st.spinner("Consultando bases de datos (Pasado vs Futuro)..."):
                 codigo_generado = cerebro.pensar_y_programar(pregunta)
-                
-                # Opcional: Mostrar código generado (debug)
-                # with st.expander("Ver código generado"):
-                #    st.code(codigo_generado)
                 
                 tipo_resp, contenido_resp = cerebro.ejecutar(codigo_generado)
                 
                 if tipo_resp == "ERR":
                     st.error(contenido_resp)
-                    with st.expander("Ver código fallido"):
+                    with st.expander("Ver código generado"):
                         st.code(codigo_generado)
                 else:
                     if tipo_resp == "TXT":

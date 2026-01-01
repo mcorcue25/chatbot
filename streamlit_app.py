@@ -54,11 +54,10 @@ def guardar_nuevo_dato_omip(nuevo_dato_dict):
     if not df_actual.empty:
         # Filtramos para no duplicar la fecha de hoy si ya existe
         fecha_hoy = str(date.today())
-        # Convertimos a string para comparar seguro
         df_actual['Fecha'] = df_actual['Fecha'].astype(str)
         df_actual = df_actual[df_actual['Fecha'] != fecha_hoy]
         
-        # Unimos (concatena columnas automáticamente si coinciden los nombres)
+        # Unimos
         df_final = pd.concat([df_actual, df_nuevo], ignore_index=True)
     else:
         df_final = df_nuevo
@@ -73,16 +72,13 @@ def actualizar_omip():
     st.info("⏳ Iniciando robot para leer OMIP...")
     
     # 1. Averiguar qué contratos necesitamos buscar
-    # Leemos la cabecera del Sheet para saber qué columnas quiere el usuario
     df_ref = cargar_historico_omip()
     if df_ref.empty:
-        # Si está vacío, usamos una lista por defecto basada en tu archivo
         columnas_objetivo = [
             "Q1-26", "Q2-26", "Q3-26", "Q4-26", "Q1-27", "Q2-27", "Q3-27",
             "YR-26", "YR-27", "YR-28", "YR-29", "YR-30", "YR-31", "YR-32"
         ]
     else:
-        # Usamos las columnas del Excel (menos 'Fecha')
         columnas_objetivo = [c for c in df_ref.columns if c != 'Fecha']
 
     # 2. Configurar Selenium
@@ -100,14 +96,12 @@ def actualizar_omip():
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         time.sleep(3)
         
-        # Diccionario para la fila de hoy
         datos_hoy = {"Fecha": str(date.today())}
         encontrados = 0
         
         # 3. Buscar cada contrato
         for contrato in columnas_objetivo:
             try:
-                # Busca texto que contenga el nombre del contrato (ej: "YR-26")
                 xpath = f"//*[contains(text(), '{contrato}')]"
                 elementos = driver.find_elements(By.XPATH, xpath)
                 
@@ -115,22 +109,17 @@ def actualizar_omip():
                 
                 for elem in elementos:
                     try:
-                        # Truco: Subir al padre para leer la línea entera
                         padre = elem.find_element(By.XPATH, "./..")
                         texto_linea = padre.get_attribute("textContent")
-                        
-                        # Limpiar texto
                         texto_linea = " ".join(texto_linea.split())
                         
-                        # Buscar números en esa línea
                         partes = texto_linea.split()
                         for parte in partes:
-                            # Si es un número y NO es parte del nombre (ej: no coger '26' de 'YR-26')
                             if any(c.isdigit() for c in parte) and contrato not in parte:
                                 p_clean = parte.replace("€", "").replace(",", ".")
                                 try:
                                     precio_final = float(p_clean)
-                                    break # Encontramos precio
+                                    break 
                                 except: continue
                         
                         if precio_final: break
@@ -148,7 +137,7 @@ def actualizar_omip():
         guardar_nuevo_dato_omip(datos_hoy)
         st.success(f"✅ Datos guardados en Google Sheets. ({encontrados} contratos actualizados)")
         time.sleep(1)
-        st.rerun() # Recargar para ver los datos nuevos
+        st.rerun()
         
     except Exception as e:
         st.error(f"❌ Error scraping: {e}")
@@ -163,7 +152,7 @@ def actualizar_esios():
         st.error("❌ Falta ESIOS_TOKEN en secrets.")
         return
 
-    years = [2022,2023,2024, 2025, 2026]
+    years = [2022, 2023, 2024, 2025, 2026]
     dfs = []
     bar = st.progress(0)
     
@@ -193,42 +182,45 @@ def actualizar_esios():
         st.rerun()
 
 # ==========================================
-# 4. INTELIGENCIA ARTIFICIAL
+# 4. INTELIGENCIA ARTIFICIAL (MODIFICADA)
 # ==========================================
 def consultar_ia(pregunta, df_spot, df_omip):
     try:
         client = Groq(api_key=st.secrets["GROQ_API_KEY"])
         
-        # Preparamos pequeños resúmenes para no saturar a la IA
+        # Contexto de datos reducido para el prompt
         txt_spot = df_spot.tail(48).to_string(index=False) if df_spot is not None else "Sin datos"
         txt_omip = df_omip.head(5).to_string(index=False) if not df_omip.empty else "Sin datos"
         
         prompt = f"""
-        Eres un experto analista energético.
+        ACTÚA COMO UN GENERADOR DE CÓDIGO PYTHON PURO PARA ANÁLISIS DE DATOS.
         
-        DATOS SPOT (Horario, últimas 48h):
-        {txt_spot}
-        
-        DATOS FUTUROS OMIP (Diario, estructura unificada):
-        {txt_omip}
-        
-        PREGUNTA: {pregunta}
-        
-        INSTRUCCIONES:
-        - Si necesitas calcular algo o graficar, GENERA CÓDIGO PYTHON.
-        - Usa las variables 'df_spot' y 'df_omip'.
-        - 'df_omip' tiene columnas como 'Q1-26', 'YR-27', etc. y 'Fecha'.
-        - Guarda el texto de respuesta en la variable 'resultado'.
+        CONTEXTO DE DATOS DISPONIBLES:
+        1. df_spot (pandas DataFrame): Datos horarios. Columnas: [fecha_hora, precio].
+           Muestra: {txt_spot}
+           
+        2. df_omip (pandas DataFrame): Futuros diarios. Columnas: [Fecha, Q1-26, YR-27...].
+           Muestra: {txt_omip}
+
+        OBJETIVO DEL USUARIO:
+        {pregunta}
+
+        REGLAS ESTRICTAS DE GENERACIÓN (OBLIGATORIO):
+        1. RESPONDE ÚNICAMENTE CON CÓDIGO PYTHON VÁLIDO.
+        2. NO incluyas texto introductorio, ni explicaciones, ni markdown (evita ```python).
+        3. Debes crear una variable llamada 'resultado' (string) que contenga la respuesta textual final para el usuario.
+        4. Si generas un gráfico, usa 'plt.figure()', dibuja y NO uses plt.show().
+        5. Asume que las librerías 'pd' y 'plt' y los dataframes 'df_spot' y 'df_omip' ya existen.
         """
         
         chat = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.3-70b-versatile",
-            temperature=0.1
+            temperature=0.0 # Cero creatividad para evitar charla
         )
         return chat.choices[0].message.content
     except Exception as e:
-        return f"Error IA: {e}"
+        return f"resultado = 'Error en la llamada a la IA: {e}'"
 
 # ==========================================
 # INTERFAZ PRINCIPAL
@@ -259,29 +251,49 @@ for m in st.session_state.mensajes:
         elif m["tipo"] == "img": st.pyplot(m["cont"])
 
 if q := st.chat_input("Pregunta a tu Data Warehouse..."):
+    # Guardamos pregunta usuario
     st.session_state.mensajes.append({"rol": "user", "tipo": "texto", "cont": q})
     with st.chat_message("user"): st.write(q)
     
     with st.chat_message("assistant"):
-        with st.spinner("Pensando..."):
-            resp = consultar_ia(q, df_spot, df_omip)
+        with st.spinner("Analizando y generando código..."):
+            # 1. Obtener respuesta cruda de la IA
+            resp_raw = consultar_ia(q, df_spot, df_omip)
             
-            if "import" in resp or "df_" in resp:
-                code = resp.replace("```python","").replace("```","").strip()
-                st.session_state.mensajes.append({"rol": "assistant", "tipo": "codigo", "cont": code})
-                st.code(code)
-                try:
-                    local_vars = {"pd":pd, "plt":plt, "df_spot":df_spot, "df_omip":df_omip, "resultado":None}
-                    exec(code, {}, local_vars)
-                    if local_vars["resultado"]:
-                        st.write(local_vars["resultado"])
-                        st.session_state.mensajes.append({"rol": "assistant", "tipo": "texto", "cont": local_vars["resultado"]})
-                    if plt.get_fignums():
-                        fig = plt.gcf()
-                        st.pyplot(fig)
-                        st.session_state.mensajes.append({"rol": "assistant", "tipo": "img", "cont": fig})
-                        plt.clf()
-                except Exception as e: st.error(f"Error código: {e}")
-            else:
-                st.write(resp)
-                st.session_state.mensajes.append({"rol": "assistant", "tipo": "texto", "cont": resp})
+            # 2. Limpieza de seguridad por si la IA pone markdown
+            code_clean = resp_raw.replace("```python", "").replace("```", "").strip()
+            
+            # Mostramos el código que se va a ejecutar
+            st.code(code_clean)
+            st.session_state.mensajes.append({"rol": "assistant", "tipo": "codigo", "cont": code_clean})
+            
+            # 3. Ejecución dinámica
+            try:
+                # Diccionario local donde ocurrirá la magia
+                local_vars = {
+                    "pd": pd, 
+                    "plt": plt, 
+                    "df_spot": df_spot, 
+                    "df_omip": df_omip, 
+                    "resultado": "La IA no generó la variable 'resultado'."
+                }
+                
+                exec(code_clean, {}, local_vars)
+                
+                # 4. Procesar resultados
+                resultado_texto = local_vars.get("resultado", "")
+                
+                # Si hay texto, lo mostramos
+                if resultado_texto:
+                    st.write(resultado_texto)
+                    st.session_state.mensajes.append({"rol": "assistant", "tipo": "texto", "cont": resultado_texto})
+                
+                # Si hay gráficos, los mostramos
+                if plt.get_fignums():
+                    fig = plt.gcf()
+                    st.pyplot(fig)
+                    st.session_state.mensajes.append({"rol": "assistant", "tipo": "img", "cont": fig})
+                    plt.clf() # Limpiamos figura para la próxima
+                    
+            except Exception as e:
+                st.error(f"Error ejecutando código generado: {e}")

@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import time
 import os
+import re  # <--- NUEVO: Importante para limpiar el texto de la IA
 from datetime import date
 import matplotlib.pyplot as plt
 from groq import Groq
@@ -77,7 +78,7 @@ def actualizar_omip():
     
     try:
         driver = webdriver.Chrome(options=chrome_options)
-        driver.get("https://www.omip.pt/es")
+        driver.get("[https://www.omip.pt/es](https://www.omip.pt/es)")
         
         wait = WebDriverWait(driver, 15)
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
@@ -138,7 +139,7 @@ def actualizar_esios():
     bar = st.progress(0)
     
     for i, year in enumerate(years):
-        url = "https://api.esios.ree.es/indicators/805"
+        url = "[https://api.esios.ree.es/indicators/805](https://api.esios.ree.es/indicators/805)"
         headers = {"x-api-key": token}
         params = {"start_date": f"{year}-01-01T00:00", "end_date": f"{year}-12-31T23:59", "time_trunc": "hour"}
         
@@ -165,7 +166,7 @@ def actualizar_esios():
         st.rerun()
 
 # ==========================================
-# 4. INTELIGENCIA ARTIFICIAL (CORREGIDA FECHAS)
+# 4. INTELIGENCIA ARTIFICIAL (CON REGEX)
 # ==========================================
 def consultar_ia(pregunta, df_spot, df_omip):
     try:
@@ -176,31 +177,20 @@ def consultar_ia(pregunta, df_spot, df_omip):
         txt_omip = df_omip.head(5).to_string(index=False) if not df_omip.empty else "Sin datos"
         
         prompt = f"""
-        ACTÚA COMO UN GENERADOR DE CÓDIGO PYTHON EXPERTO.
+        ACTÚA COMO UN PROGRAMADOR PYTHON JUNIOR PERO ROBOTICO.
         
-        DATOS (Variables Globales Disponibles):
-        1. df_spot (DataFrame): [fecha_hora, precio].
-        2. df_omip (DataFrame): [Fecha, ...].
-           COLUMNAS EXACTAS: {cols_omip}
+        DATOS:
+        1. df_spot: [fecha_hora, precio].
+        2. df_omip: [Fecha, ...]. Cols: {cols_omip}
            Muestra: {txt_omip}
 
-        OBJETIVO: {pregunta}
+        TAREA: {pregunta}
 
-        REGLAS OBLIGATORIAS:
-        1. NO asumas que los datos existen (usa if not df.empty).
-        2. La variable final debe llamarse 'resultado' (string).
-        3. Solo código Python puro.
-        4. Asume que 'pd' y 'plt' ya están importados.
-        
-        5. !!! ATENCIÓN CON LAS FECHAS (IMPORTANTE) !!!:
-           La columna 'Fecha' en df_omip es de tipo DATETIME64 (Pandas Timestamp).
-           NO LA COMPARES con 'datetime.date' nativo de Python porque dará error.
-           
-           MALO (Error): df[df['Fecha'] == date(2026, 1, 1)]
-           BUENO (Correcto): df[df['Fecha'] == pd.Timestamp("2026-01-01")]
-           BUENO (Correcto): df[df['Fecha'].dt.date == date(2026, 1, 1)]
-           
-           Usa siempre 'pd.Timestamp' para filtrar fechas.
+        REGLAS:
+        1. Tu respuesta debe contener UN BLOQUE DE CÓDIGO Markdown (```python ... ```).
+        2. DENTRO DE ESE BLOQUE, escribe el código para resolver la duda y guardar el texto final en la variable 'resultado'.
+        3. NO asumas que hay datos (usa if not empty).
+        4. OJO FECHAS: df_omip['Fecha'] es Timestamp. NO USES datetime.date para comparar. Usa pd.Timestamp("YYYY-MM-DD").
         """
         
         chat = client.chat.completions.create(
@@ -247,21 +237,35 @@ if q := st.chat_input("Pregunta a tu Data Warehouse..."):
     with st.chat_message("user"): st.write(q)
     
     with st.chat_message("assistant"):
-        with st.spinner("Analizando y generando código..."):
+        with st.spinner("Analizando..."):
             resp_raw = consultar_ia(q, df_spot, df_omip)
-            code_clean = resp_raw.replace("```python", "").replace("```", "").strip()
             
+            # --- LIMPIEZA CON REGEX (SOLUCIÓN AL ERROR) ---
+            # Buscamos texto entre ```python y ``` (o solo ```)
+            patron = r"```python(.*?)```"
+            match = re.search(patron, resp_raw, re.DOTALL)
+            
+            if match:
+                code_clean = match.group(1).strip()
+            else:
+                # Si no encuentra python, intenta buscar bloques genéricos
+                match_gen = re.search(r"```(.*?)```", resp_raw, re.DOTALL)
+                if match_gen:
+                    code_clean = match_gen.group(1).strip()
+                else:
+                    # Si la IA no puso bloques, asumimos que todo es código (riesgo)
+                    code_clean = resp_raw.replace("```python", "").replace("```", "").strip()
+
             st.code(code_clean)
             st.session_state.mensajes.append({"rol": "assistant", "tipo": "codigo", "cont": code_clean})
             
             try:
-                # Contexto Unificado (Solución definitiva para variables)
                 contexto_ejecucion = {
                     "pd": pd, 
                     "plt": plt, 
                     "df_spot": df_spot, 
                     "df_omip": df_omip, 
-                    "date": date, # Agregamos date por si la IA insiste en usarlo
+                    "date": date, 
                     "resultado": None 
                 }
                 
@@ -272,8 +276,6 @@ if q := st.chat_input("Pregunta a tu Data Warehouse..."):
                 if resultado_texto:
                     st.write(resultado_texto)
                     st.session_state.mensajes.append({"rol": "assistant", "tipo": "texto", "cont": resultado_texto})
-                else:
-                    st.warning("El código se ejecutó pero no generó la variable 'resultado'.")
                 
                 if plt.get_fignums():
                     fig = plt.gcf()
@@ -282,4 +284,4 @@ if q := st.chat_input("Pregunta a tu Data Warehouse..."):
                     plt.clf()
                     
             except Exception as e:
-                st.error(f"Error ejecutando código generado: {e}")
+                st.error(f"Error ejecutando código: {e}")

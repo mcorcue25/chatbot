@@ -184,9 +184,7 @@ def actualizar_esios():
 # ==========================================
 # 4. INTELIGENCIA ARTIFICIAL (MODIFICADA)
 # ==========================================
-def consultar_ia(pregunta, df_spot, df_omip):
-    try:
-        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+
         # ==========================================
 # 4. INTELIGENCIA ARTIFICIAL (MEJORADA - ANTI-ERRORES)
 # ==========================================

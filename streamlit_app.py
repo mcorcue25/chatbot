@@ -29,9 +29,7 @@ def obtener_conexion_gsheets():
 def cargar_historico_omip():
     try:
         conn = obtener_conexion_gsheets()
-        # Leemos la hoja. ttl=0 para que no use caché y lea siempre lo fresco
         df = conn.read(ttl=0)
-        # Aseguramos que la fecha sea datetime para ordenar bien
         if not df.empty and 'Fecha' in df.columns:
             df['Fecha'] = pd.to_datetime(df['Fecha'])
             df = df.sort_values('Fecha', ascending=False)
@@ -167,47 +165,42 @@ def actualizar_esios():
         st.rerun()
 
 # ==========================================
-# 4. INTELIGENCIA ARTIFICIAL (BLINDADA)
+# 4. INTELIGENCIA ARTIFICIAL (CORREGIDA FECHAS)
 # ==========================================
 def consultar_ia(pregunta, df_spot, df_omip):
     try:
         client = Groq(api_key=st.secrets["GROQ_API_KEY"])
         
-        # Preparamos muestras de datos y nombres de columnas para evitar alucinaciones
         txt_spot = df_spot.tail(48).to_string(index=False) if df_spot is not None else "Sin datos"
         cols_omip = list(df_omip.columns) if not df_omip.empty else "Sin columnas"
         txt_omip = df_omip.head(5).to_string(index=False) if not df_omip.empty else "Sin datos"
         
         prompt = f"""
-        ACTÚA COMO UN GENERADOR DE CÓDIGO PYTHON EXPERTO Y ROBUSTO.
+        ACTÚA COMO UN GENERADOR DE CÓDIGO PYTHON EXPERTO.
         
-        DATOS DISPONIBLES (Variables Globales):
+        DATOS (Variables Globales Disponibles):
         1. df_spot (DataFrame): [fecha_hora, precio].
         2. df_omip (DataFrame): [Fecha, ...].
-           COLUMNAS EXACTAS DISPONIBLES EN DF_OMIP: {cols_omip}
-           Muestra datos: {txt_omip}
+           COLUMNAS EXACTAS: {cols_omip}
+           Muestra: {txt_omip}
 
-        OBJETIVO:
-        {pregunta}
+        OBJETIVO: {pregunta}
 
-        REGLAS DE SEGURIDAD (CRÍTICO PARA EVITAR CRASH):
-        1. NO asumas que los datos siempre existen.
-        2. ANTES de extraer un valor único (ej: `valor = df_filt.values[0]`), DEBES verificar si el dataframe filtrado tiene filas.
+        REGLAS OBLIGATORIAS:
+        1. NO asumas que los datos existen (usa if not df.empty).
+        2. La variable final debe llamarse 'resultado' (string).
+        3. Solo código Python puro.
+        4. Asume que 'pd' y 'plt' ya están importados.
+        
+        5. !!! ATENCIÓN CON LAS FECHAS (IMPORTANTE) !!!:
+           La columna 'Fecha' en df_omip es de tipo DATETIME64 (Pandas Timestamp).
+           NO LA COMPARES con 'datetime.date' nativo de Python porque dará error.
            
-           MALO:
-           precio = df_omip.loc[...].values[0] # Esto crashea si no hay datos
+           MALO (Error): df[df['Fecha'] == date(2026, 1, 1)]
+           BUENO (Correcto): df[df['Fecha'] == pd.Timestamp("2026-01-01")]
+           BUENO (Correcto): df[df['Fecha'].dt.date == date(2026, 1, 1)]
            
-           BUENO:
-           filtro = df_omip.loc[...]
-           if not filtro.empty:
-               precio = filtro.values[0]
-           else:
-               resultado = "No se encontraron datos para esa fecha/contrato."
-               # Detener lógica aquí o manejar el error
-
-        3. La variable final a mostrar debe llamarse 'resultado' (string).
-        4. RESPONDE SOLO CÓDIGO PYTHON PURO (sin markdown, sin explicaciones).
-        5. Asume que 'pd' y 'plt' ya están importados.
+           Usa siempre 'pd.Timestamp' para filtrar fechas.
         """
         
         chat = client.chat.completions.create(
@@ -250,46 +243,38 @@ for m in st.session_state.mensajes:
         elif m["tipo"] == "img": st.pyplot(m["cont"])
 
 if q := st.chat_input("Pregunta a tu Data Warehouse..."):
-    # Guardar y mostrar pregunta del usuario
     st.session_state.mensajes.append({"rol": "user", "tipo": "texto", "cont": q})
     with st.chat_message("user"): st.write(q)
     
     with st.chat_message("assistant"):
         with st.spinner("Analizando y generando código..."):
-            # 1. Obtener código de la IA
             resp_raw = consultar_ia(q, df_spot, df_omip)
             code_clean = resp_raw.replace("```python", "").replace("```", "").strip()
             
-            # Mostrar el código generado
             st.code(code_clean)
             st.session_state.mensajes.append({"rol": "assistant", "tipo": "codigo", "cont": code_clean})
             
-            # 2. Ejecución Robusta (CORREGIDA: CONTEXTO UNIFICADO)
             try:
-                # Creamos un contexto unificado. Al pasarlo como único argumento a exec,
-                # funciona como Global y Local a la vez, solucionando el error de 'pd not defined'.
+                # Contexto Unificado (Solución definitiva para variables)
                 contexto_ejecucion = {
                     "pd": pd, 
                     "plt": plt, 
                     "df_spot": df_spot, 
                     "df_omip": df_omip, 
+                    "date": date, # Agregamos date por si la IA insiste en usarlo
                     "resultado": None 
                 }
                 
-                # Ejecutamos pasando el contexto una sola vez
                 exec(code_clean, contexto_ejecucion)
                 
-                # 3. Recuperar resultados del mismo diccionario
                 resultado_texto = contexto_ejecucion.get("resultado", "")
                 
-                # Mostrar texto si existe
                 if resultado_texto:
                     st.write(resultado_texto)
                     st.session_state.mensajes.append({"rol": "assistant", "tipo": "texto", "cont": resultado_texto})
                 else:
                     st.warning("El código se ejecutó pero no generó la variable 'resultado'.")
                 
-                # Mostrar gráficos si existen
                 if plt.get_fignums():
                     fig = plt.gcf()
                     st.pyplot(fig)

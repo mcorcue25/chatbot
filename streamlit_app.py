@@ -36,7 +36,7 @@ def actualizar_esios():
         st.error("❌ Error: No he encontrado 'ESIOS_TOKEN' en los Secrets.")
         return False
 
-    years = [2024, 2025] 
+    years = [2022, 2023,2024, 2025, 2026] 
     dfs = []
     
     progress_bar = st.progress(0)

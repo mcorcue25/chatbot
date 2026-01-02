@@ -5,6 +5,7 @@ import time
 import os
 import datetime
 import pytz
+import re  # <--- IMPORTANTE: Necesario para limpiar la respuesta de la IA
 import matplotlib.pyplot as plt
 import seaborn as sns
 from groq import Groq
@@ -20,11 +21,10 @@ from streamlit_gsheets import GSheetsConnection
 st.set_page_config(page_title="Monitor Energía 360", page_icon="⚡", layout="wide")
 st.title("⚡ Monitor de Energía (Spot + Futuros Automáticos)")
 
-# Nombre EXACTO del archivo local para evitar errores
 FILE_SPOT = "datos_luz.csv"
 
 # ==========================================
-# 1. GESTIÓN DE GOOGLE SHEETS (LECTURA Y ESCRITURA)
+# 1. GESTIÓN DE GOOGLE SHEETS
 # ==========================================
 def obtener_conexion():
     return st.connection("gsheets", type=GSheetsConnection)
@@ -32,10 +32,8 @@ def obtener_conexion():
 def cargar_omip_sheets():
     try:
         conn = obtener_conexion()
-        # ttl=0 obliga a leer datos frescos, no caché
         df = conn.read(ttl=0)
         
-        # Limpieza robusta
         if 'Fecha' in df.columns:
             df['Fecha'] = pd.to_datetime(df['Fecha'], dayfirst=True, errors='coerce')
             df = df.sort_values('Fecha', ascending=False)
@@ -52,53 +50,36 @@ def cargar_omip_sheets():
         return pd.DataFrame()
 
 def guardar_fila_en_sheets(nuevo_dato_dict):
-    """
-    Descarga el Sheet actual, añade la fila de hoy y lo sube de nuevo.
-    """
     try:
         conn = obtener_conexion()
         df_actual = conn.read(ttl=0)
         
-        # Crear DataFrame con la nueva fila
         df_nuevo = pd.DataFrame([nuevo_dato_dict])
         
-        # Concatenar (si ya existe datos o si está vacío)
         if not df_actual.empty:
-            # Convertimos fechas a string para evitar duplicados de HOY
             hoy_str = str(date.today())
-            # Asumimos que la columna fecha puede venir como string o date
-            # Hacemos una limpieza temporal para verificar
             df_actual['temp_date'] = pd.to_datetime(df_actual['Fecha'], dayfirst=True, errors='coerce').dt.date.astype(str)
-            
-            # Si ya existe una fila con la fecha de hoy, la borramos para sobreescribirla
             df_actual = df_actual[df_actual['temp_date'] != hoy_str]
             df_actual = df_actual.drop(columns=['temp_date'])
-            
             df_final = pd.concat([df_actual, df_nuevo], ignore_index=True)
         else:
             df_final = df_nuevo
             
-        # ACTUALIZAR GOOGLE SHEETS
         conn.update(data=df_final)
         st.toast("✅ Google Sheet actualizado correctamente!", icon="🚀")
         return True
-        
     except Exception as e:
-        st.error(f"❌ Error escribiendo en Google Sheets: {e}")
-        st.info("💡 Nota: Para escribir necesitas configurar 'service_account' en secrets.toml, no solo la URL pública.")
+        st.error(f"❌ Error escribiendo en Sheets: {e}")
         return False
 
 # ==========================================
-# 2. SCRAPING OMIP (SELENIUM) - RECUPERADO
+# 2. ROBOT OMIP
 # ==========================================
 def ejecutar_robot_omip():
-    """
-    Escanea la web de OMIP, obtiene los precios y llama a guardar_fila_en_sheets.
-    """
     CONTRATOS = ["Q1-26", "Q2-26", "Q3-26", "Q4-26", "Q1-27", "Q2-27", "Q3-27",
                  "YR-26", "YR-27", "YR-28", "YR-29", "YR-30", "YR-31", "YR-32"]
     
-    st.info("🤖 Robot iniciando escaneo de OMIP...")
+    st.info("🤖 Iniciando escaneo OMIP...")
     
     chrome_options = Options()
     chrome_options.add_argument("--headless")
@@ -114,7 +95,6 @@ def ejecutar_robot_omip():
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         time.sleep(3)
         
-        # Diccionario con la fecha de hoy en formato dd/mm/yyyy (formato español)
         datos_hoy = {"Fecha": date.today().strftime("%d/%m/%Y")}
         encontrados = 0
         
@@ -128,19 +108,13 @@ def ejecutar_robot_omip():
                     try:
                         padre = elem.find_element(By.XPATH, "./..")
                         texto = padre.get_attribute("textContent")
-                        texto = " ".join(texto.split()) # Quitar espacios extra
-                        
+                        texto = " ".join(texto.split())
                         partes = texto.split()
                         for parte in partes:
                             if any(c.isdigit() for c in parte) and contrato not in parte:
-                                # OMIP usa coma para decimales (64,50) -> convertimos a string con coma
-                                # OJO: Para Sheets, si tu locale es ES, prefiere coma. Si es US, punto.
-                                # Vamos a guardar como string limpio "64.50" o float directamtnte
                                 p_clean = parte.replace("€", "").replace(",", ".")
                                 try:
                                     precio = float(p_clean)
-                                    # Para el Sheet, lo guardamos formateado como string con coma si tu Excel lo requiere,
-                                    # o float si streamlit-gsheets lo maneja. Probemos float nativo.
                                     break
                                 except: continue
                         if precio: break
@@ -154,28 +128,28 @@ def ejecutar_robot_omip():
         driver.quit()
         
         if encontrados > 0:
-            st.success(f"🔍 Escaneo completado. {encontrados} contratos encontrados.")
+            st.success(f"🔍 {encontrados} contratos encontrados.")
             guardar_fila_en_sheets(datos_hoy)
             return True
         else:
-            st.warning("⚠️ El robot no encontró precios. ¿Quizás la web cambió?")
+            st.warning("⚠️ No se encontraron precios.")
             return False
             
     except Exception as e:
-        st.error(f"❌ Error crítico del robot: {e}")
+        st.error(f"❌ Error robot: {e}")
         return False
 
 # ==========================================
-# 3. ACTUALIZAR ESIOS (SPOT)
+# 3. ESIOS
 # ==========================================
 def actualizar_esios():
     try:
         token = st.secrets["ESIOS_TOKEN"]
     except:
-        st.error("❌ Falta ESIOS_TOKEN en secrets.")
+        st.error("❌ Falta ESIOS_TOKEN.")
         return False
 
-    years = [2024, 2025, 2026] # Añadido 2026 por si acaso
+    years = [2024, 2025, 2026]
     dfs = []
     bar = st.progress(0)
     
@@ -201,12 +175,12 @@ def actualizar_esios():
     if dfs:
         full = pd.concat(dfs).sort_values('fecha_hora')
         full.to_csv(FILE_SPOT, index=False)
-        st.success(f"✅ Spot descargado y guardado en {FILE_SPOT}")
+        st.success("✅ Spot actualizado.")
         return True
     return False
 
 # ==========================================
-# 4. CEREBRO IA (CON PROTECCIÓN DE ARCHIVOS)
+# 4. CEREBRO IA (FIX: LIMPIEZA REGEX)
 # ==========================================
 class CerebroGroq:
     def __init__(self, df_spot, df_omip, api_key):
@@ -218,27 +192,23 @@ class CerebroGroq:
         zona_es = pytz.timezone('Europe/Madrid')
         hoy_str = datetime.datetime.now(zona_es).strftime("%Y-%m-%d")
         
-        # Info para el prompt
         cols_omip = list(self.df_omip.columns) if self.df_omip is not None else []
         sample_omip = self.df_omip.head(3).to_markdown(index=False) if self.df_omip is not None else "Sin datos"
 
         prompt = f"""
-        ERES UN DATA SCIENTIST EXPERTO EN PYTHON.
-        FECHA ACTUAL: {hoy_str}
+        ERES UN EXPERTO EN PYTHON. FECHA: {hoy_str}
         
-        TIENES ESTAS VARIABLES CARGADAS EN MEMORIA (NO LEAS ARCHIVOS):
-        1. df_spot (DataFrame): Histórico horario. Cols: [fecha_hora, precio].
-        2. df_omip (DataFrame): Futuros diarios. Cols: {cols_omip}.
-           Muestra: {sample_omip}
+        VARIABLES DISPONIBLES EN MEMORIA:
+        1. df_spot (DataFrame): [fecha_hora, precio].
+        2. df_omip (DataFrame): [Fecha, ...]. Cols: {cols_omip}. Muestra: {sample_omip}
         
         OBJETIVO: {pregunta}
         
-        REGLAS DE SEGURIDAD (MUY IMPORTANTE):
-        1. ¡¡¡PROHIBIDO USAR pd.read_csv()!!! Los datos YA ESTÁN en 'df_spot' y 'df_omip'.
-        2. Si intentas leer 'df_spot.csv' el programa fallará. USA LA VARIABLE df_spot.
-        3. Para Futuros usa 'df_omip'. Para Pasado/Spot usa 'df_spot'.
-        4. Genera solo código Python.
-        5. Guarda el resultado texto en la variable 'resultado'.
+        REGLAS ESTRICTAS:
+        1. Genera UN ÚNICO bloque de código dentro de ```python ... ```.
+        2. NO escribas nada después del bloque de código.
+        3. NO uses pd.read_csv, usa las variables df_spot y df_omip.
+        4. Guarda el resultado texto en 'resultado'.
         """
         
         try:
@@ -247,21 +217,31 @@ class CerebroGroq:
                 model="llama-3.3-70b-versatile",
                 temperature=0.0
             )
-            code = chat.choices[0].message.content.replace("```python", "").replace("```", "").strip()
-            return code
+            raw_response = chat.choices[0].message.content
+            
+            # --- CORRECCIÓN CRÍTICA: EXTRAER SOLO EL CÓDIGO CON REGEX ---
+            # Busca lo que esté entre ```python y ``` (o solo ```)
+            match = re.search(r"```python(.*?)```", raw_response, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+            
+            # Si no dice python, busca cualquier bloque de código
+            match_generic = re.search(r"```(.*?)```", raw_response, re.DOTALL)
+            if match_generic:
+                return match_generic.group(1).strip()
+            
+            # Si no hay bloques, devolvemos todo (con riesgo, pero limpiando espacios)
+            return raw_response.replace("```python", "").replace("```", "").strip()
+
         except Exception as e:
             return f"resultado = 'Error IA: {e}'"
 
     def ejecutar(self, codigo):
         try:
-            # Contexto blindado: Pasamos las variables explícitamente
             ctx = {
                 "df_spot": self.df_spot,
                 "df_omip": self.df_omip,
-                "pd": pd,
-                "plt": plt,
-                "sns": sns,
-                "date": date,
+                "pd": pd, "plt": plt, "sns": sns, "date": date,
                 "resultado": None
             }
             exec(codigo, ctx)
@@ -271,7 +251,7 @@ class CerebroGroq:
             
             if len(fig.axes) > 0: return "IMG", fig
             elif res: return "TXT", str(res)
-            else: return "ERR", "Código ejecutado pero sin resultado."
+            else: return "ERR", "El código se ejecutó pero no generó 'resultado'."
             
         except Exception as e:
             return "ERR", f"Error ejecución: {e}"
@@ -280,7 +260,6 @@ class CerebroGroq:
 # INTERFAZ
 # ==========================================
 
-# Carga inicial segura
 @st.cache_data
 def cargar_spot_seguro():
     if os.path.exists(FILE_SPOT):
@@ -299,30 +278,22 @@ if "GROQ_API_KEY" in st.secrets:
     cerebro = CerebroGroq(df_spot, df_omip, st.secrets["GROQ_API_KEY"])
 
 with st.sidebar:
-    st.header("⚙️ Operaciones")
-    
-    # BOTÓN 1: ESIOS
-    if st.button("📥 Descargar Histórico (Spot)"):
+    st.header("⚙️ Panel")
+    if st.button("📥 Descargar Spot"):
         if actualizar_esios():
             st.cache_data.clear()
             st.rerun()
             
-    # BOTÓN 2: OMIP (ROBOT + SUBIDA)
-    if st.button("🤖 Robot OMIP -> Google Sheets"):
+    if st.button("🤖 Robot OMIP -> Sheets"):
         if ejecutar_robot_omip():
-            st.cache_data.clear() # Limpiamos caché para ver los datos nuevos
+            st.cache_data.clear()
             time.sleep(1)
             st.rerun()
     
     st.divider()
-    st.write("Estado de Datos:")
     if df_spot is not None: st.success(f"Spot: {len(df_spot)} regs")
-    else: st.error("Falta descargar Spot")
-    
     if df_omip is not None and not df_omip.empty: st.success(f"Futuros: {len(df_omip)} días")
-    else: st.warning("No hay datos de Futuros")
 
-# Chat App
 st.subheader("💬 Asistente Energía")
 
 if "mensajes" not in st.session_state: st.session_state.mensajes = []
@@ -341,14 +312,16 @@ if q := st.chat_input("Pregunta..."):
         with st.chat_message("assistant"):
             with st.spinner("Analizando..."):
                 code = cerebro.pensar_y_programar(q)
+                
+                # Ejecutar
                 tipo, res = cerebro.ejecutar(code)
                 
                 if tipo == "ERR":
                     st.error(res)
-                    with st.expander("Ver código"): st.code(code)
+                    with st.expander("Ver código fallido"): st.code(code)
                 else:
                     if tipo == "TXT": st.write(res)
                     elif tipo == "IMG": st.pyplot(res)
                     st.session_state.mensajes.append({"rol": "assistant", "tipo": tipo, "cont": res})
     else:
-        st.error("Faltan datos (Spot) o API Key.")
+        st.error("Faltan datos o API Key.")

@@ -79,7 +79,7 @@ def ejecutar_robot_omip():
     CONTRATOS = ["Q1-26", "Q2-26", "Q3-26", "Q4-26", "Q1-27", "Q2-27", "Q3-27",
                  "YR-26", "YR-27", "YR-28", "YR-29", "YR-30", "YR-31", "YR-32"]
     
-    st.info("🤖 Iniciando escaneo OMIP...")
+    st.info("🤖 Robot iniciando escaneo de OMIP...")
     
     chrome_options = Options()
     chrome_options.add_argument("--headless")
@@ -128,60 +128,87 @@ def ejecutar_robot_omip():
         driver.quit()
         
         if encontrados > 0:
-            st.success(f"🔍 {encontrados} contratos encontrados.")
+            st.success(f"🔍 Escaneo completado. {encontrados} contratos encontrados.")
             guardar_fila_en_sheets(datos_hoy)
             return True
         else:
-            st.warning("⚠️ No se encontraron precios.")
+            st.warning("⚠️ El robot no encontró precios.")
             return False
             
     except Exception as e:
-        st.error(f"❌ Error robot: {e}")
+        st.error(f"❌ Error crítico del robot: {e}")
         return False
 
 # ==========================================
-# 3. ESIOS (SPOT)
+# 3. ESIOS (SPOT) - 2026 FORZADO
 # ==========================================
 def actualizar_esios():
     try:
         token = st.secrets["ESIOS_TOKEN"]
     except:
-        st.error("❌ Falta ESIOS_TOKEN.")
+        st.error("❌ Falta ESIOS_TOKEN en secrets.")
         return False
 
-    # IMPORTANTE: Aseguramos que 2026 está en la lista para que baje datos de este año
+    # --- CAMBIO AQUÍ: Lista explícita con 2026 ---
     years = [2024, 2025, 2026]
+    
     dfs = []
     bar = st.progress(0)
+    placeholder_status = st.empty()
+    
+    # Obtenemos fecha de hoy real
+    hoy = date.today()
     
     for i, year in enumerate(years):
+        placeholder_status.text(f"⏳ Descargando año {year}...")
+        
         url = "https://api.esios.ree.es/indicators/805"
         headers = {"x-api-key": token}
-        params = {"start_date": f"{year}-01-01T00:00", "end_date": f"{year}-12-31T23:59", "time_trunc": "hour"}
+        
+        # Configuración de fechas
+        start = f"{year}-01-01T00:00"
+        
+        if year >= hoy.year:
+            # Si pedimos el año actual o futuro, cortamos en "mañana" para coger hasta la última hora de hoy
+            end = (hoy + datetime.timedelta(days=1)).strftime("%Y-%m-%dT23:59")
+        else:
+            # Años pasados completos
+            end = f"{year}-12-31T23:59"
+            
+        params = {"start_date": start, "end_date": end, "time_trunc": "hour"}
         
         try:
             r = requests.get(url, headers=headers, params=params)
             if r.status_code == 200:
-                vals = r.json()['indicator']['values']
-                if vals:
-                    df = pd.DataFrame(vals)
-                    if 'geo_id' in df.columns: df = df[df['geo_id'] == 8741]
-                    df = df.rename(columns={'value': 'precio', 'datetime': 'fecha_hora'})
-                    df['fecha_hora'] = pd.to_datetime(df['fecha_hora'], utc=True).dt.tz_convert('Europe/Madrid').dt.tz_localize(None)
-                    dfs.append(df[['fecha_hora', 'precio']])
-        except: pass
+                data = r.json()
+                if 'indicator' in data and 'values' in data['indicator']:
+                    vals = data['indicator']['values']
+                    if vals:
+                        df = pd.DataFrame(vals)
+                        if 'geo_id' in df.columns: df = df[df['geo_id'] == 8741] # Península
+                        df = df.rename(columns={'value': 'precio', 'datetime': 'fecha_hora'})
+                        df['fecha_hora'] = pd.to_datetime(df['fecha_hora'], utc=True).dt.tz_convert('Europe/Madrid').dt.tz_localize(None)
+                        dfs.append(df[['fecha_hora', 'precio']])
+        except Exception as e: 
+            st.error(f"❌ Error descargando {year}: {e}")
+        
         bar.progress((i+1)/len(years))
     
+    placeholder_status.empty()
     bar.empty()
+    
     if dfs:
         full = pd.concat(dfs).sort_values('fecha_hora')
+        full = full.drop_duplicates(subset=['fecha_hora'])
         full.to_csv(FILE_SPOT, index=False)
-        st.success("✅ Spot actualizado correctamente.")
+        st.success(f"✅ Spot actualizado. Último dato: {full['fecha_hora'].max()}")
         return True
+    
+    st.error("❌ No se han podido descargar datos nuevos.")
     return False
 
 # ==========================================
-# 4. CEREBRO IA (CON PROTECCIÓN ANTI-NAN)
+# 4. CEREBRO IA
 # ==========================================
 class CerebroGroq:
     def __init__(self, df_spot, df_omip, api_key):
@@ -199,24 +226,17 @@ class CerebroGroq:
         prompt = f"""
         ERES UN DATA SCIENTIST EXPERTO. FECHA ACTUAL: {hoy_str}
         
-        VARIABLES EN MEMORIA:
+        DATOS EN MEMORIA:
         1. df_spot (DataFrame): [fecha_hora, precio].
         2. df_omip (DataFrame): [Fecha, ...]. Cols: {cols_omip}. Muestra: {sample_omip}
         
         OBJETIVO: {pregunta}
         
-        REGLAS ESTRICTAS (ANTI-ERRORES):
-        1. NO uses pd.read_csv. Usa las variables df_spot y df_omip directamente.
-        2. IMPORTANTE: Antes de calcular medias o acceder a datos, VERIFICA QUE EL DATAFRAME FILTRADO NO ESTÉ VACÍO.
-           Mal: 
-             media = df_filtrado['precio'].mean() (Esto da 'nan' si está vacío)
-           Bien: 
-             if df_filtrado.empty:
-                 resultado = "No hay datos disponibles para esa fecha. Por favor actualiza el histórico."
-             else:
-                 media = df_filtrado['precio'].mean()
-                 resultado = f"El precio medio es {{media}}..."
-        3. Genera un único bloque de código ```python ... ```.
+        REGLAS:
+        1. NO uses pd.read_csv. Usa las variables df_spot y df_omip.
+        2. ANTES de calcular, VERIFICA si hay datos (if not df.empty).
+           - Si pides datos de ayer/hoy y df_spot está vacío para esa fecha, responde "Faltan datos, actualiza el histórico".
+        3. Genera UN ÚNICO bloque de código ```python ... ```.
         4. Guarda la respuesta final en 'resultado'.
         """
         
@@ -228,7 +248,6 @@ class CerebroGroq:
             )
             raw_response = chat.choices[0].message.content
             
-            # Limpieza con Regex
             match = re.search(r"```python(.*?)```", raw_response, re.DOTALL)
             if match:
                 return match.group(1).strip()
@@ -282,13 +301,11 @@ if "GROQ_API_KEY" in st.secrets:
 with st.sidebar:
     st.header("⚙️ Panel de Control")
     
-    # 1. BOTÓN ESIOS
     if st.button("📥 Descargar Histórico (Spot)"):
         if actualizar_esios():
             st.cache_data.clear()
             st.rerun()
             
-    # 2. BOTÓN OMIP
     if st.button("🤖 Robot OMIP -> Sheets"):
         if ejecutar_robot_omip():
             st.cache_data.clear()
@@ -297,7 +314,6 @@ with st.sidebar:
     
     st.divider()
     
-    # --- INDICADOR DE ESTADO DE DATOS (NUEVO) ---
     st.write("📊 **Estado de los Datos**")
     
     if df_spot is not None: 
@@ -305,16 +321,16 @@ with st.sidebar:
         st.success(f"Spot: OK ({len(df_spot)} regs)")
         st.caption(f"📅 Último dato: {ultimo_dato}")
         
-        # Alerta visual si los datos son viejos
+        # Alerta año
         if ultimo_dato.year < date.today().year:
-            st.warning("⚠️ Tus datos son antiguos. Pulsa 'Descargar Histórico'.")
+            st.error("⚠️ Pulsa 'Descargar Histórico' para obtener 2026.")
     else: 
-        st.error("Falta descargar Spot")
+        st.error("⚠️ Faltan datos Spot.")
     
     if df_omip is not None and not df_omip.empty: 
         st.success(f"Futuros: OK ({len(df_omip)} días)")
     else: 
-        st.warning("No hay datos de Futuros")
+        st.warning("⚠️ No hay datos de Futuros.")
 
 st.subheader("💬 Asistente Energía")
 

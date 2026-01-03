@@ -5,7 +5,7 @@ import time
 import os
 import datetime
 import pytz
-import re  # <--- IMPORTANTE: Necesario para limpiar la respuesta de la IA
+import re
 import matplotlib.pyplot as plt
 import seaborn as sns
 from groq import Groq
@@ -18,8 +18,8 @@ from datetime import date
 from streamlit_gsheets import GSheetsConnection
 
 # --- CONFIGURACIÓN GLOBAL ---
-st.set_page_config(page_title="Monitor Energía 360", page_icon="⚡", layout="wide")
-st.title("⚡ Monitor de Energía (Spot + Futuros Automáticos)")
+st.set_page_config(page_title="Monitor Energía 2026", page_icon="⚡", layout="wide")
+st.title("⚡ Monitor de Energía (Spot + Futuros)")
 
 FILE_SPOT = "datos_luz.csv"
 
@@ -73,7 +73,7 @@ def guardar_fila_en_sheets(nuevo_dato_dict):
         return False
 
 # ==========================================
-# 2. ROBOT OMIP
+# 2. ROBOT OMIP (SELENIUM)
 # ==========================================
 def ejecutar_robot_omip():
     CONTRATOS = ["Q1-26", "Q2-26", "Q3-26", "Q4-26", "Q1-27", "Q2-27", "Q3-27",
@@ -140,7 +140,7 @@ def ejecutar_robot_omip():
         return False
 
 # ==========================================
-# 3. ESIOS
+# 3. ESIOS (SPOT)
 # ==========================================
 def actualizar_esios():
     try:
@@ -149,6 +149,7 @@ def actualizar_esios():
         st.error("❌ Falta ESIOS_TOKEN.")
         return False
 
+    # IMPORTANTE: Aseguramos que 2026 está en la lista para que baje datos de este año
     years = [2024, 2025, 2026]
     dfs = []
     bar = st.progress(0)
@@ -175,12 +176,12 @@ def actualizar_esios():
     if dfs:
         full = pd.concat(dfs).sort_values('fecha_hora')
         full.to_csv(FILE_SPOT, index=False)
-        st.success("✅ Spot actualizado.")
+        st.success("✅ Spot actualizado correctamente.")
         return True
     return False
 
 # ==========================================
-# 4. CEREBRO IA (FIX: LIMPIEZA REGEX)
+# 4. CEREBRO IA (CON PROTECCIÓN ANTI-NAN)
 # ==========================================
 class CerebroGroq:
     def __init__(self, df_spot, df_omip, api_key):
@@ -196,19 +197,27 @@ class CerebroGroq:
         sample_omip = self.df_omip.head(3).to_markdown(index=False) if self.df_omip is not None else "Sin datos"
 
         prompt = f"""
-        ERES UN EXPERTO EN PYTHON. FECHA: {hoy_str}
+        ERES UN DATA SCIENTIST EXPERTO. FECHA ACTUAL: {hoy_str}
         
-        VARIABLES DISPONIBLES EN MEMORIA:
+        VARIABLES EN MEMORIA:
         1. df_spot (DataFrame): [fecha_hora, precio].
         2. df_omip (DataFrame): [Fecha, ...]. Cols: {cols_omip}. Muestra: {sample_omip}
         
         OBJETIVO: {pregunta}
         
-        REGLAS ESTRICTAS:
-        1. Genera UN ÚNICO bloque de código dentro de ```python ... ```.
-        2. NO escribas nada después del bloque de código.
-        3. NO uses pd.read_csv, usa las variables df_spot y df_omip.
-        4. Guarda el resultado texto en 'resultado'.
+        REGLAS ESTRICTAS (ANTI-ERRORES):
+        1. NO uses pd.read_csv. Usa las variables df_spot y df_omip directamente.
+        2. IMPORTANTE: Antes de calcular medias o acceder a datos, VERIFICA QUE EL DATAFRAME FILTRADO NO ESTÉ VACÍO.
+           Mal: 
+             media = df_filtrado['precio'].mean() (Esto da 'nan' si está vacío)
+           Bien: 
+             if df_filtrado.empty:
+                 resultado = "No hay datos disponibles para esa fecha. Por favor actualiza el histórico."
+             else:
+                 media = df_filtrado['precio'].mean()
+                 resultado = f"El precio medio es {{media}}..."
+        3. Genera un único bloque de código ```python ... ```.
+        4. Guarda la respuesta final en 'resultado'.
         """
         
         try:
@@ -219,18 +228,11 @@ class CerebroGroq:
             )
             raw_response = chat.choices[0].message.content
             
-            # --- CORRECCIÓN CRÍTICA: EXTRAER SOLO EL CÓDIGO CON REGEX ---
-            # Busca lo que esté entre ```python y ``` (o solo ```)
+            # Limpieza con Regex
             match = re.search(r"```python(.*?)```", raw_response, re.DOTALL)
             if match:
                 return match.group(1).strip()
             
-            # Si no dice python, busca cualquier bloque de código
-            match_generic = re.search(r"```(.*?)```", raw_response, re.DOTALL)
-            if match_generic:
-                return match_generic.group(1).strip()
-            
-            # Si no hay bloques, devolvemos todo (con riesgo, pero limpiando espacios)
             return raw_response.replace("```python", "").replace("```", "").strip()
 
         except Exception as e:
@@ -278,12 +280,15 @@ if "GROQ_API_KEY" in st.secrets:
     cerebro = CerebroGroq(df_spot, df_omip, st.secrets["GROQ_API_KEY"])
 
 with st.sidebar:
-    st.header("⚙️ Panel")
-    if st.button("📥 Descargar Spot"):
+    st.header("⚙️ Panel de Control")
+    
+    # 1. BOTÓN ESIOS
+    if st.button("📥 Descargar Histórico (Spot)"):
         if actualizar_esios():
             st.cache_data.clear()
             st.rerun()
             
+    # 2. BOTÓN OMIP
     if st.button("🤖 Robot OMIP -> Sheets"):
         if ejecutar_robot_omip():
             st.cache_data.clear()
@@ -291,8 +296,25 @@ with st.sidebar:
             st.rerun()
     
     st.divider()
-    if df_spot is not None: st.success(f"Spot: {len(df_spot)} regs")
-    if df_omip is not None and not df_omip.empty: st.success(f"Futuros: {len(df_omip)} días")
+    
+    # --- INDICADOR DE ESTADO DE DATOS (NUEVO) ---
+    st.write("📊 **Estado de los Datos**")
+    
+    if df_spot is not None: 
+        ultimo_dato = df_spot['fecha_hora'].max()
+        st.success(f"Spot: OK ({len(df_spot)} regs)")
+        st.caption(f"📅 Último dato: {ultimo_dato}")
+        
+        # Alerta visual si los datos son viejos
+        if ultimo_dato.year < date.today().year:
+            st.warning("⚠️ Tus datos son antiguos. Pulsa 'Descargar Histórico'.")
+    else: 
+        st.error("Falta descargar Spot")
+    
+    if df_omip is not None and not df_omip.empty: 
+        st.success(f"Futuros: OK ({len(df_omip)} días)")
+    else: 
+        st.warning("No hay datos de Futuros")
 
 st.subheader("💬 Asistente Energía")
 
@@ -310,10 +332,8 @@ if q := st.chat_input("Pregunta..."):
     
     if cerebro and df_spot is not None:
         with st.chat_message("assistant"):
-            with st.spinner("Analizando..."):
+            with st.spinner("Pensando..."):
                 code = cerebro.pensar_y_programar(q)
-                
-                # Ejecutar
                 tipo, res = cerebro.ejecutar(code)
                 
                 if tipo == "ERR":
